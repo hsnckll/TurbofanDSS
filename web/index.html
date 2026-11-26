@@ -1,0 +1,1654 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TurbofanDSS — Savaş Uçağı Motoru Karar Destek Sistemi</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['"Plus Jakarta Sans"', '"Segoe UI"', 'system-ui', 'sans-serif'],
+            mono: ['"JetBrains Mono"', 'Consolas', 'monospace'],
+          },
+        },
+      },
+    };
+  </script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    * { box-sizing: border-box; }
+    html { font-feature-settings: "cv02", "cv03", "cv04", "cv11"; scroll-behavior: smooth; }
+    body {
+      font-family: "Plus Jakarta Sans", "Segoe UI", system-ui, sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+    .tabular { font-variant-numeric: tabular-nums; }
+    /* Özel pürüzsüz kaydırıcı (slider) */
+    input[type="range"] {
+      -webkit-appearance: none;
+      appearance: none;
+      height: 5px;
+      border-radius: 999px;
+      background: #e2e8f0;
+      outline: none;
+      cursor: pointer;
+    }
+    .dark input[type="range"] { background: #1e293b; }
+    input[type="range"]::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      appearance: none;
+      width: 16px;
+      height: 16px;
+      border-radius: 999px;
+      background: #0f172a;
+      border: 2.5px solid #ffffff;
+      box-shadow: 0 1px 4px rgba(15, 23, 42, 0.35);
+      transition: transform 0.12s ease;
+    }
+    .dark input[type="range"]::-webkit-slider-thumb {
+      background: #38bdf8;
+      border: 2.5px solid #090d16;
+    }
+    input[type="range"]::-webkit-slider-thumb:hover { transform: scale(1.16); }
+    /* İnce kaydırma çubuğu */
+    ::-webkit-scrollbar { width: 7px; height: 7px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: rgba(148, 163, 184, 0.35); border-radius: 999px; }
+    ::-webkit-scrollbar-thumb:hover { background: rgba(148, 163, 184, 0.6); }
+  </style>
+</head>
+<body class="bg-[#F8FAFC] text-slate-900 dark:bg-[#090D16] dark:text-slate-100 transition-colors duration-200">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useMemo, useRef, useCallback } = React;
+
+    // =========================================================================
+    // YARDIMCI MATEMATİK: İSTEMCİ TARAFINDA 60 FPS AHP + TOPSIS (0 ms GECİKME)
+    // core/filo_komutani_karar.py ile birebir aynı matematiksel formüller
+    // =========================================================================
+    const KRITERLER = [
+      { key: 'saglik_skoru', ad: 'Motor Sağlığı', fayda: true, renk: '#2563EB' },
+      { key: 'yakit_verimlilik_skoru', ad: 'Yakıt Verimliliği', fayda: true, renk: '#0EA5E9' },
+      { key: 'termal_denge_skoru', ad: 'Termal Denge', fayda: true, renk: '#F59E0B' },
+      { key: 'ucus_sayisi', ad: 'Motor Yaşı (Uçuş)', fayda: false, renk: '#8B5CF6' },
+    ];
+
+    const SAATY_DEGERLER = [1/9, 1/8, 1/7, 1/6, 1/5, 1/4, 1/3, 1/2, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+    const SAATY_ETIKET = ['1/9', '1/8', '1/7', '1/6', '1/5', '1/4', '1/3', '1/2', '1 (Eşit)', '2', '3', '4', '5', '6', '7', '8', '9'];
+
+    const IKILI_CIFTLER = [
+      { i: 0, j: 1, a: 'Motor Sağlığı', b: 'Yakıt Verimliliği' },
+      { i: 0, j: 2, a: 'Motor Sağlığı', b: 'Termal Denge' },
+      { i: 0, j: 3, a: 'Motor Sağlığı', b: 'Motor Yaşı' },
+      { i: 1, j: 2, a: 'Yakıt Verimliliği', b: 'Termal Denge' },
+      { i: 1, j: 3, a: 'Yakıt Verimliliği', b: 'Motor Yaşı' },
+      { i: 2, j: 3, a: 'Termal Denge', b: 'Motor Yaşı' },
+    ];
+
+    const GOREV_PROFILLERI = {
+      dengeli: {
+        ad: 'Dengeli Görev',
+        alt: 'Standart devriye & rutin uçuş',
+        aciklama: 'Motor sağlığı ana önceliktedir; yakıt verimliliği ve termal denge eşit destek ağırlığına sahiptir.',
+        matris: [
+          [1, 2, 2, 3],
+          [1/2, 1, 1, 2],
+          [1/2, 1, 1, 2],
+          [1/3, 1/2, 1/2, 1],
+        ],
+      },
+      kritik_gorev: {
+        ad: 'Kritik Muharebe',
+        alt: 'Yüksek risk & tam güç',
+        aciklama: 'Arıza riskini sıfıra indirmek için motor sağlığı ve yüksek sıcaklık dayanımı baskın ağırlık alır.',
+        matris: [
+          [1, 3, 2, 5],
+          [1/3, 1, 1/2, 2],
+          [1/2, 2, 1, 3],
+          [1/5, 1/2, 1/3, 1],
+        ],
+      },
+      uzun_menzil: {
+        ad: 'Uzun Menzil',
+        alt: 'Uzak hedef & yakıt ekonomisi',
+        aciklama: 'Hedefe tek depoyla ulaşmak kritik olduğu için yakıt verimliliği en yüksek ağırlığa çıkarılır.',
+        matris: [
+          [1, 1/3, 2, 3],
+          [3, 1, 4, 5],
+          [1/2, 1/4, 1, 2],
+          [1/3, 1/5, 1/2, 1],
+        ],
+      },
+    };
+
+    function saatyEnYakinIdx(val) {
+      let best = 8, bestD = Infinity;
+      SAATY_DEGERLER.forEach((v, idx) => {
+        const d = Math.abs(v - val);
+        if (d < bestD) { bestD = d; best = idx; }
+      });
+      return best;
+    }
+
+    function ahpHesapla(matris) {
+      const n = 4;
+      const colSum = [0, 0, 0, 0];
+      for (let j = 0; j < n; j++) for (let i = 0; i < n; i++) colSum[j] += matris[i][j];
+      const w = [0, 0, 0, 0];
+      for (let i = 0; i < n; i++) {
+        let s = 0;
+        for (let j = 0; j < n; j++) s += matris[i][j] / colSum[j];
+        w[i] = s / n;
+      }
+      let lam = 0;
+      for (let i = 0; i < n; i++) {
+        let aw = 0;
+        for (let j = 0; j < n; j++) aw += matris[i][j] * w[j];
+        lam += aw / w[i];
+      }
+      lam /= n;
+      const ci = (lam - n) / (n - 1);
+      const cr = Math.max(0, ci / 0.90);
+      return { agirliklar: w, cr: Number(cr.toFixed(4)), tutarli: cr < 0.10 };
+    }
+
+    function topsisSirala(filo, agirliklar) {
+      if (!filo || filo.length === 0) return [];
+      const n = filo.length;
+      const denom = [0, 0, 0, 0];
+      for (let k = 0; k < 4; k++) {
+        const key = KRITERLER[k].key;
+        let s = 0;
+        for (let i = 0; i < n; i++) s += filo[i][key] * filo[i][key];
+        denom[k] = Math.sqrt(s) || 1e-6;
+      }
+      const wm = filo.map((u) => KRITERLER.map((kr, k) => (u[kr.key] / denom[k]) * agirliklar[k]));
+      const idealIyi = [0, 0, 0, 0];
+      const idealKotu = [0, 0, 0, 0];
+      for (let k = 0; k < 4; k++) {
+        const col = wm.map((r) => r[k]);
+        const mx = Math.max(...col), mn = Math.min(...col);
+        idealIyi[k] = KRITERLER[k].fayda ? mx : mn;
+        idealKotu[k] = KRITERLER[k].fayda ? mn : mx;
+      }
+      const list = filo.map((u, idx) => {
+        let dIyi = 0, dKotu = 0;
+        for (let k = 0; k < 4; k++) {
+          dIyi += (wm[idx][k] - idealIyi[k]) ** 2;
+          dKotu += (wm[idx][k] - idealKotu[k]) ** 2;
+        }
+        dIyi = Math.sqrt(dIyi);
+        dKotu = Math.sqrt(dKotu);
+        const skor = dKotu / (dIyi + dKotu || 1e-6);
+        let karar = 'GÖREVE UYGUN';
+        if (u.tahmini_kalan_omur < 25 || u.saglik_skoru < 30 || skor < 0.30) karar = 'UÇAMAZ (BAKIMA AL)';
+        else if (skor < 0.55 || u.saglik_skoru < 60) karar = 'KISITLI GÖREV';
+        return { ...u, topsis_skor: Number(skor.toFixed(4)), karar };
+      });
+      list.sort((a, b) => b.topsis_skor - a.topsis_skor);
+      return list.map((item, i) => ({ ...item, siralama: i + 1 }));
+    }
+
+    function csvIndir(satirlar, basliklar, dosyaAdi) {
+      const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+      const csv = '\uFEFF' + [basliklar.map((b) => esc(b.ad)).join(','), ...satirlar.map((r) => basliklar.map((b) => esc(r[b.key])).join(','))].join('\n');
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = dosyaAdi;
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+
+    // =========================================================================
+    // KÜÇÜK MİNİMALİST UI BİLEŞENLERİ (SADE, TEMİZ, PREMIUM)
+    // =========================================================================
+    function DurumRozeti({ metin }) {
+      const up = String(metin || '').toUpperCase();
+      let cls = 'bg-emerald-50 text-emerald-700 ring-emerald-600/20 dark:bg-emerald-500/10 dark:text-emerald-400 dark:ring-emerald-500/25';
+      let nokta = 'bg-emerald-500';
+      if (up.includes('UÇAMAZ') || up.includes('ACİL') || up.includes('KRİTİK') || up.includes('HPC')) {
+        cls = 'bg-rose-50 text-rose-700 ring-rose-600/20 dark:bg-rose-500/10 dark:text-rose-400 dark:ring-rose-500/25';
+        nokta = 'bg-rose-500';
+      } else if (up.includes('KISITLI') || up.includes('PLANLI') || up.includes('UYARI') || up.includes('ORTA') || up.includes('DÜŞÜR')) {
+        cls = 'bg-amber-50 text-amber-700 ring-amber-600/20 dark:bg-amber-500/10 dark:text-amber-400 dark:ring-amber-500/25';
+        nokta = 'bg-amber-500';
+      } else if (up.includes('PERVANE') || up.includes('FAN')) {
+        cls = 'bg-sky-50 text-sky-700 ring-sky-600/20 dark:bg-sky-500/10 dark:text-sky-400 dark:ring-sky-500/25';
+        nokta = 'bg-sky-500';
+      }
+      return (
+        <span className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11.5px] font-semibold ring-1 ring-inset whitespace-nowrap ${cls}`}>
+          <span className={`w-1.5 h-1.5 rounded-full ${nokta}`} />
+          {metin}
+        </span>
+      );
+    }
+
+    function MetrikKarti({ etiket, deger, alt, vurgu = 'slate' }) {
+      const renk = {
+        slate: 'text-slate-900 dark:text-white',
+        blue: 'text-blue-600 dark:text-sky-400',
+        emerald: 'text-emerald-600 dark:text-emerald-400',
+        amber: 'text-amber-600 dark:text-amber-400',
+        rose: 'text-rose-600 dark:text-rose-400',
+      }[vurgu] || 'text-slate-900 dark:text-white';
+
+      return (
+        <div className="bg-white dark:bg-[#111827] border border-slate-200/80 dark:border-slate-800/90 rounded-2xl px-5 py-4 shadow-[0_1px_2px_rgba(15,23,42,0.03)]">
+          <div className="text-xs font-medium text-slate-500 dark:text-slate-400">{etiket}</div>
+          <div className={`mt-1.5 text-[28px] leading-tight font-extrabold tracking-tight font-mono tabular ${renk}`}>{deger}</div>
+          {alt && <div className="mt-1 text-xs text-slate-500 dark:text-slate-400 truncate">{alt}</div>}
+        </div>
+      );
+    }
+
+    function DonutHalka({ dilimler, merkezUst, merkezAlt }) {
+      const toplam = dilimler.reduce((s, d) => s + d.deger, 0) || 1;
+      const r = 64;
+      const cevre = 2 * Math.PI * r;
+      let ofset = 0;
+      return (
+        <div className="flex flex-col sm:flex-row items-center gap-7">
+          <div className="relative w-44 h-44 shrink-0">
+            <svg viewBox="0 0 160 160" className="w-full h-full -rotate-90">
+              <circle cx="80" cy="80" r={r} fill="none" stroke="currentColor" strokeWidth="18" className="text-slate-100 dark:text-slate-800" />
+              {dilimler.map((d) => {
+                const pay = d.deger / toplam;
+                const uzunluk = Math.max(0, pay * cevre - 3);
+                const curOfset = ofset;
+                ofset += pay * cevre;
+                return (
+                  <circle
+                    key={d.ad}
+                    cx="80" cy="80" r={r}
+                    fill="none"
+                    stroke={d.renk}
+                    strokeWidth="18"
+                    strokeDasharray={`${uzunluk} ${cevre}`}
+                    strokeDashoffset={-curOfset}
+                    strokeLinecap="butt"
+                    className="transition-all duration-500"
+                  />
+                );
+              })}
+            </svg>
+            <div className="absolute inset-0 flex flex-col items-center justify-center text-center">
+              <span className="text-2xl font-extrabold font-mono tabular text-slate-900 dark:text-white">{merkezUst}</span>
+              <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400">{merkezAlt}</span>
+            </div>
+          </div>
+          <div className="flex-1 w-full space-y-3">
+            {dilimler.map((d) => {
+              const pct = Math.round((d.deger / toplam) * 100);
+              return (
+                <div key={d.ad} className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ backgroundColor: d.renk }} />
+                    <span className="text-sm font-medium text-slate-700 dark:text-slate-200 truncate">{d.ad}</span>
+                  </div>
+                  <div className="flex items-baseline gap-2 shrink-0 font-mono tabular">
+                    <span className="text-sm font-bold text-slate-900 dark:text-white">{d.deger}</span>
+                    <span className="text-xs text-slate-400 w-9 text-right">%{pct}</span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    // =========================================================================
+    // 1. EKRAN: GENEL BAKIŞ (FİLO ÖZET PANELİ)
+    // =========================================================================
+    function EkranGenelBakis({ siraliFilo, onBakimaGit, onSimuleEt }) {
+      const stats = useMemo(() => {
+        const toplam = siraliFilo.length;
+        const uygun = siraliFilo.filter((u) => u.karar === 'GÖREVE UYGUN').length;
+        const kisitli = siraliFilo.filter((u) => u.karar.startsWith('KISITLI')).length;
+        const ucamaz = siraliFilo.filter((u) => u.karar.startsWith('UÇAMAZ')).length;
+        const saglikli = siraliFilo.filter((u) => u.ariza_tipi === 'saglikli').length;
+        const hpc = siraliFilo.filter((u) => u.ariza_tipi === 'hpc').length;
+        const fan = siraliFilo.filter((u) => u.ariza_tipi === 'fan').length;
+        const ortSaglik = toplam ? (siraliFilo.reduce((s, u) => s + u.saglik_skoru, 0) / toplam) : 0;
+        const ortOmur = toplam ? (siraliFilo.reduce((s, u) => s + u.tahmini_kalan_omur, 0) / toplam) : 0;
+        return { toplam, uygun, kisitli, ucamaz, saglikli, hpc, fan, ortSaglik, ortOmur };
+      }, [siraliFilo]);
+
+      const riskliListe = useMemo(
+        () => [...siraliFilo].sort((a, b) => a.tahmini_kalan_omur - b.tahmini_kalan_omur).slice(0, 10),
+        [siraliFilo]
+      );
+
+      const indirCsv = () => {
+        csvIndir(
+          siraliFilo,
+          [
+            { key: 'siralama', ad: 'Sira' },
+            { key: 'ucak_id', ad: 'Ucak_No' },
+            { key: 'topsis_skor', ad: 'TOPSIS_Skor' },
+            { key: 'karar', ad: 'Gorev_Karari' },
+            { key: 'tahmini_kalan_omur', ad: 'Tahmini_Omur' },
+            { key: 'kalan_ucus_omru', ad: 'Gercek_Omur' },
+            { key: 'saglik_skoru', ad: 'Saglik_Yuzde' },
+            { key: 'ariza_etiketi', ad: 'Ariza_Modu' },
+          ],
+          'TurbofanDSS_FD003_Filo_Ozeti.csv'
+        );
+      };
+
+      return (
+        <div className="space-y-6">
+          {/* 4 Ana Hero Metrik */}
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+            <MetrikKarti etiket="Göreve Hazır Uçak" deger={stats.uygun} alt={`100 uçağın %${stats.uygun}'i tam operasyonel`} vurgu="emerald" />
+            <MetrikKarti etiket="Kısıtlı Görev" deger={stats.kisitli} alt="Kısa menzil veya yakın izleme" vurgu="amber" />
+            <MetrikKarti etiket="Acil Bakım (Uçamaz)" deger={stats.ucamaz} alt="Ömür < 25 uçuş veya sağlık < %30" vurgu="rose" />
+            <MetrikKarti etiket="Ortalama Filo Sağlığı" deger={`%${stats.ortSaglik.toFixed(1)}`} alt={`Ort. kalan ömür: ${stats.ortOmur.toFixed(1)} uçuş`} vurgu="blue" />
+          </div>
+
+          {/* 2 Dengeli Grafik Kartı */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            <div className="bg-white dark:bg-[#111827] border border-slate-200/80 dark:border-slate-800/90 rounded-2xl p-6 shadow-[0_1px_2px_rgba(15,23,42,0.03)]">
+              <div className="mb-5">
+                <h2 className="text-[15px] font-bold text-slate-900 dark:text-white">Filo Operasyon Hazırlığı</h2>
+                <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">Dengeli AHP–TOPSIS karar eşiklerine göre 100 test uçağının durumu</p>
+              </div>
+              <DonutHalka
+                merkezUst={stats.toplam}
+                merkezAlt="Test Uçağı"
+                dilimler={[
+                  { ad: 'Göreve Uygun', deger: stats.uygun, renk: '#10B981' },
+                  { ad: 'Kısıtlı Görev', deger: stats.kisitli, renk: '#F59E0B' },
+                  { ad: 'Uçamaz (Bakım)', deger: stats.ucamaz, renk: '#F43F5E' },
+                ]}
+              />
+            </div>
+
+            <div className="bg-white dark:bg-[#111827] border border-slate-200/80 dark:border-slate-800/90 rounded-2xl p-6 shadow-[0_1px_2px_rgba(15,23,42,0.03)] flex flex-col justify-between">
+              <div className="mb-5">
+                <h2 className="text-[15px] font-bold text-slate-900 dark:text-white">FD003 Çift Arıza Modu Dağılımı</h2>
+                <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">Sistem yalnızca veri setindeki 2 gerçek kök arızayı (HPC ve Ön Pervane) teşhis eder</p>
+              </div>
+              <div className="space-y-4">
+                {[
+                  { ad: 'Sağlıklı (Normal Sensör Aralığı)', sayi: stats.saglikli, renk: 'bg-emerald-500', aciklama: 'Ana sensörlerde kritik sapma yok' },
+                  { ad: 'Ana Hava Sıkıştırıcı (HPC) Arızası', sayi: stats.hpc, renk: 'bg-rose-500', aciklama: 's11 basınç & s15 dış/iç hava artışı, s12 düşüşü' },
+                  { ad: 'Ön Pervane (Fan) Arızası', sayi: stats.fan, renk: 'bg-sky-500', aciklama: 's15 düşüşü, s8 hız & s10 basınç oranı artışı' },
+                ].map((k) => (
+                  <div key={k.ad} className="space-y-1.5">
+                    <div className="flex items-baseline justify-between gap-2">
+                      <div>
+                        <span className="text-sm font-semibold text-slate-800 dark:text-slate-100">{k.ad}</span>
+                        <span className="hidden sm:inline text-[11px] text-slate-400 ml-2">— {k.aciklama}</span>
+                      </div>
+                      <span className="font-mono tabular text-sm font-bold text-slate-900 dark:text-white shrink-0">{k.sayi} uçak</span>
+                    </div>
+                    <div className="h-2.5 w-full rounded-full bg-slate-100 dark:bg-slate-800 overflow-hidden">
+                      <div className={`h-full rounded-full ${k.renk} transition-all duration-500`} style={{ width: `${(k.sayi / Math.max(1, stats.toplam)) * 100}%` }} />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          {/* Acil Müdahale Tablosu (Sade 6 Sütun) */}
+          <div className="bg-white dark:bg-[#111827] border border-slate-200/80 dark:border-slate-800/90 rounded-2xl shadow-[0_1px_2px_rgba(15,23,42,0.03)] overflow-hidden">
+            <div className="px-6 py-4 border-b border-slate-100 dark:border-slate-800 flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h2 className="text-[15px] font-bold text-slate-900 dark:text-white">Öncelikli Bakım Gerektiren İlk 10 Uçak</h2>
+                <p className="text-xs text-slate-500 dark:text-slate-400">Herhangi bir uçağa tıklayarak kök neden teşhisini anında açabilirsiniz</p>
+              </div>
+              <button
+                onClick={indirCsv}
+                className="px-3.5 py-1.5 rounded-xl text-xs font-semibold border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 transition"
+              >
+                Tüm Filoyu CSV İndir
+              </button>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-left border-collapse">
+                <thead>
+                  <tr className="text-[11px] font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400 bg-slate-50/70 dark:bg-slate-900/50 border-b border-slate-100 dark:border-slate-800">
+                    <th className="py-3 px-6">Uçak</th>
+                    <th className="py-3 px-4">Tahmini / Gerçek Ömür</th>
+                    <th className="py-3 px-4">Motor Sağlığı</th>
+                    <th className="py-3 px-4">Tespit Edilen Arıza</th>
+                    <th className="py-3 px-4">Karar</th>
+                    <th className="py-3 px-6 text-right">Hızlı İşlem</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 dark:divide-slate-800/70 text-sm">
+                  {riskliListe.map((u) => (
+                    <tr
+                      key={u.ucak_id}
+                      onClick={() => onBakimaGit(u.ucak_id)}
+                      className="hover:bg-slate-50/90 dark:hover:bg-slate-800/40 cursor-pointer transition-colors"
+                    >
+                      <td className="py-3.5 px-6 font-mono font-bold text-slate-900 dark:text-white">#{u.ucak_id}</td>
+                      <td className="py-3.5 px-4 font-mono tabular">
+                        <span className="font-bold text-slate-900 dark:text-white">{u.tahmini_kalan_omur.toFixed(1)}</span>
+                        <span className="text-slate-400 text-xs ml-1.5">/ {u.kalan_ucus_omru} uçuş</span>
+                      </td>
+                      <td className="py-3.5 px-4">
+                        <div className="flex items-center gap-2.5">
+                          <div className="w-20 h-1.5 rounded-full bg-slate-100 dark:bg-slate-800 overflow-hidden">
+                            <div
+                              className={`h-full rounded-full ${u.saglik_skoru < 30 ? 'bg-rose-500' : u.saglik_skoru < 60 ? 'bg-amber-500' : 'bg-emerald-500'}`}
+                              style={{ width: `${Math.min(100, u.saglik_skoru)}%` }}
+                            />
+                          </div>
+                          <span className="font-mono tabular text-xs font-semibold text-slate-700 dark:text-slate-300">%{u.saglik_skoru.toFixed(1)}</span>
+                        </div>
+                      </td>
+                      <td className="py-3.5 px-4"><DurumRozeti metin={u.ariza_etiketi} /></td>
+                      <td className="py-3.5 px-4"><DurumRozeti metin={u.karar} /></td>
+                      <td className="py-3.5 px-6 text-right space-x-2" onClick={(e) => e.stopPropagation()}>
+                        <button
+                          onClick={() => onBakimaGit(u.ucak_id)}
+                          className="text-xs font-semibold text-blue-600 dark:text-sky-400 hover:underline"
+                        >
+                          Teşhis
+                        </button>
+                        <span className="text-slate-300 dark:text-slate-700">·</span>
+                        <button
+                          onClick={() => onSimuleEt(u.ucak_id)}
+                          className="text-xs font-semibold text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white"
+                        >
+                          Simüle Et
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // =========================================================================
+    // 2. EKRAN: ROL 1 — FİLO KOMUTANI (AHP + TOPSIS — ANLIK 60 FPS)
+    // =========================================================================
+    function EkranFiloKomutani({ hamFilo, onUcakSec }) {
+      const [profil, setProfil] = useState('dengeli');
+      const [ozelAcik, setOzelAcik] = useState(false);
+      const [saatyIdx, setSaatyIdx] = useState([10, 10, 11, 8, 10, 10]); // dengeli varsayılan
+      const [arama, setArama] = useState('');
+      const [filtre, setFiltre] = useState('TUMU');
+
+      const profilSec = (kod) => {
+        setProfil(kod);
+        if (kod === 'ozel') {
+          setOzelAcik(true);
+          return;
+        }
+        const m = GOREV_PROFILLERI[kod].matris;
+        setSaatyIdx(IKILI_CIFTLER.map((c) => saatyEnYakinIdx(m[c.i][c.j])));
+      };
+
+      const surguDegistir = (pos, yeniIdx) => {
+        const kopya = [...saatyIdx];
+        kopya[pos] = yeniIdx;
+        setSaatyIdx(kopya);
+        if (profil !== 'ozel') setProfil('ozel');
+      };
+
+      const { agirliklar, cr, tutarli, sirali } = useMemo(() => {
+        let matris;
+        if (profil !== 'ozel') {
+          matris = GOREV_PROFILLERI[profil].matris;
+        } else {
+          matris = [[1,1,1,1],[1,1,1,1],[1,1,1,1],[1,1,1,1]];
+          IKILI_CIFTLER.forEach((c, idx) => {
+            const v = SAATY_DEGERLER[saatyIdx[idx]];
+            matris[c.i][c.j] = v;
+            matris[c.j][c.i] = 1 / v;
+          });
+        }
+        const ahp = ahpHesapla(matris);
+        const s = topsisSirala(hamFilo, ahp.agirliklar);
+        return { ...ahp, sirali: s };
+      }, [hamFilo, profil, saatyIdx]);
+
+      const filtrelenmis = useMemo(() => {
+        return sirali.filter((u) => {
+          if (arama.trim() && !String(u.ucak_id).includes(arama.trim().replace('#', ''))) return false;
+          if (filtre === 'UYGUN' && u.karar !== 'GÖREVE UYGUN') return false;
+          if (filtre === 'KISITLI' && !u.karar.startsWith('KISITLI')) return false;
+          if (filtre === 'UCAMAZ' && !u.karar.startsWith('UÇAMAZ')) return false;
+          return true;
+        });
+      }, [sirali, arama, filtre]);
+
+      const ilkUc = sirali.slice(0, 3);
+      const uygunSay = sirali.filter((u) => u.karar === 'GÖREVE UYGUN').length;
+      const kisitliSay = sirali.filter((u) => u.karar.startsWith('KISITLI')).length;
+      const ucamazSay = sirali.filter((u) => u.karar.startsWith('UÇAMAZ')).length;
+
+      return (
+        <div className="space-y-6">
+          {/* Üst Görev Profili Seçimi + Anlık AHP Ağırlıkları */}
+          <div className="bg-white dark:bg-[#111827] border border-slate-200/80 dark:border-slate-800/90 rounded-2xl p-6 shadow-[0_1px_2px_rgba(15,23,42,0.03)] space-y-5">
+            <div className="flex flex-wrap items-center justify-between gap-4">
+              <div>
+                <h2 className="text-[15px] font-bold text-slate-900 dark:text-white">Görev Profili ve AHP Ağırlıkları</h2>
+                <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                  {profil === 'ozel' ? 'Özel ikili karşılaştırma matrisi etkin — 100 uçak anlık yeniden sıralanıyor' : GOREV_PROFILLERI[profil].aciklama}
+                </p>
+              </div>
+              <div className="flex items-center gap-2.5">
+                <span className={`px-3 py-1 rounded-full text-xs font-mono font-bold ring-1 ring-inset ${
+                  tutarli
+                    ? 'bg-emerald-50 text-emerald-700 ring-emerald-600/20 dark:bg-emerald-500/10 dark:text-emerald-400 dark:ring-emerald-500/25'
+                    : 'bg-rose-50 text-rose-700 ring-rose-600/20 dark:bg-rose-500/10 dark:text-rose-400 dark:ring-rose-500/25'
+                }`}>
+                  CR: {cr.toFixed(4)} {tutarli ? '• Tutarlı' : '• Tutarsız'}
+                </span>
+                <button
+                  onClick={() => setOzelAcik((v) => !v)}
+                  className="px-3.5 py-1.5 rounded-xl text-xs font-semibold border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 transition"
+                >
+                  {ozelAcik ? 'Matris Sürgülerini Gizle' : 'Özel AHP Sürgüleri'}
+                </button>
+              </div>
+            </div>
+
+            {/* 3 Hazır Profil Kartı */}
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+              {Object.entries(GOREV_PROFILLERI).map(([kod, info]) => {
+                const aktif = profil === kod;
+                return (
+                  <button
+                    key={kod}
+                    onClick={() => profilSec(kod)}
+                    className={`text-left p-4 rounded-xl border transition-all ${
+                      aktif
+                        ? 'bg-slate-900 text-white border-slate-900 dark:bg-sky-500/15 dark:border-sky-400/60 dark:text-white shadow-sm'
+                        : 'bg-slate-50/70 dark:bg-slate-900/40 border-slate-200/80 dark:border-slate-800 hover:border-slate-300 dark:hover:border-slate-700'
+                    }`}
+                  >
+                    <div className="text-sm font-bold">{info.ad}</div>
+                    <div className={`text-xs mt-0.5 ${aktif ? 'text-slate-300 dark:text-sky-200' : 'text-slate-500 dark:text-slate-400'}`}>{info.alt}</div>
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* Canlı AHP Kriter Ağırlık Çubukları (4 Kriter) */}
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 pt-1">
+              {KRITERLER.map((kr, idx) => {
+                const pct = agirliklar[idx] * 100;
+                return (
+                  <div key={kr.key} className="space-y-1.5">
+                    <div className="flex justify-between items-baseline text-xs">
+                      <span className="font-medium text-slate-600 dark:text-slate-300">{kr.ad}</span>
+                      <span className="font-mono tabular font-bold text-slate-900 dark:text-white">%{pct.toFixed(1)}</span>
+                    </div>
+                    <div className="h-2 rounded-full bg-slate-100 dark:bg-slate-800 overflow-hidden">
+                      <div className="h-full rounded-full transition-all duration-300" style={{ width: `${Math.min(100, pct * 1.4)}%`, backgroundColor: kr.renk }} />
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* İsteğe Bağlı Açılır 6 Saaty Kaydırıcısı (Sayfayı Kalabalıklaştırmaz!) */}
+            {ozelAcik && (
+              <div className="pt-4 border-t border-slate-100 dark:border-slate-800 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-x-8 gap-y-4">
+                {IKILI_CIFTLER.map((c, idx) => (
+                  <div key={`${c.i}-${c.j}`} className="space-y-1.5">
+                    <div className="flex justify-between text-xs">
+                      <span className="font-medium text-slate-700 dark:text-slate-300">{c.a} ↔ {c.b}</span>
+                      <span className="font-mono font-bold text-blue-600 dark:text-sky-400">{SAATY_ETIKET[saatyIdx[idx]]}</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="0"
+                      max={SAATY_DEGERLER.length - 1}
+                      value={saatyIdx[idx]}
+                      onChange={(e) => surguDegistir(idx, Number(e.target.value))}
+                      className="w-full"
+                    />
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* En Uygun İlk 3 Uçak Öneri Şeridi */}
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            {ilkUc.map((u, idx) => (
+              <div
+                key={u.ucak_id}
+                onClick={() => onUcakSec(u.ucak_id)}
+                className="bg-white dark:bg-[#111827] border border-slate-200/80 dark:border-slate-800/90 hover:border-blue-400 dark:hover:border-sky-500/60 rounded-2xl p-5 cursor-pointer transition-all shadow-[0_1px_2px_rgba(15,23,42,0.03)] flex items-center justify-between"
+              >
+                <div>
+                  <div className="text-[11px] font-bold uppercase tracking-wider text-slate-400">{idx + 1}. Görev Önerisi</div>
+                  <div className="text-2xl font-extrabold font-mono text-slate-900 dark:text-white mt-0.5">Uçak #{u.ucak_id}</div>
+                  <div className="text-xs text-slate-500 dark:text-slate-400 mt-1">Sağlık %{u.saglik_skoru.toFixed(1)} · Ömür {u.tahmini_kalan_omur.toFixed(1)} uçuş</div>
+                </div>
+                <div className="text-right">
+                  <div className="text-[11px] text-slate-400">TOPSIS</div>
+                  <div className="text-xl font-extrabold font-mono tabular text-emerald-600 dark:text-emerald-400">{u.topsis_skor.toFixed(4)}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          {/* 100 Uçaklık Sade TOPSIS Tablosu */}
+          <div className="bg-white dark:bg-[#111827] border border-slate-200/80 dark:border-slate-800/90 rounded-2xl shadow-[0_1px_2px_rgba(15,23,42,0.03)] overflow-hidden">
+            <div className="px-6 py-4 border-b border-slate-100 dark:border-slate-800 flex flex-wrap items-center justify-between gap-3">
+              <div className="flex flex-wrap items-center gap-2">
+                {[
+                  { id: 'TUMU', ad: `Tümü (${sirali.length})` },
+                  { id: 'UYGUN', ad: `Göreve Uygun (${uygunSay})` },
+                  { id: 'KISITLI', ad: `Kısıtlı (${kisitliSay})` },
+                  { id: 'UCAMAZ', ad: `Uçamaz (${ucamazSay})` },
+                ].map((f) => (
+                  <button
+                    key={f.id}
+                    onClick={() => setFiltre(f.id)}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition ${
+                      filtre === f.id
+                        ? 'bg-slate-900 text-white dark:bg-white dark:text-slate-900'
+                        : 'text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800'
+                    }`}
+                  >
+                    {f.ad}
+                  </button>
+                ))}
+              </div>
+              <div className="flex items-center gap-2.5">
+                <input
+                  type="text"
+                  value={arama}
+                  onChange={(e) => setArama(e.target.value)}
+                  placeholder="Uçak no ara (ör. 37)..."
+                  className="px-3.5 py-1.5 rounded-xl text-xs bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 focus:outline-none focus:border-blue-500 w-44"
+                />
+                <button
+                  onClick={() => csvIndir(
+                    filtrelenmis,
+                    [
+                      { key: 'siralama', ad: 'Sira' }, { key: 'ucak_id', ad: 'Ucak_No' },
+                      { key: 'topsis_skor', ad: 'TOPSIS' }, { key: 'karar', ad: 'Karar' },
+                      { key: 'tahmini_kalan_omur', ad: 'Tahmini_Omur' }, { key: 'saglik_skoru', ad: 'Saglik' },
+                      { key: 'yakit_verimlilik_skoru', ad: 'Yakit_Skoru' }, { key: 'termal_denge_skoru', ad: 'Termal_Denge' },
+                    ],
+                    `TurbofanDSS_TOPSIS_${profil}.csv`
+                  )}
+                  className="px-3.5 py-1.5 rounded-xl text-xs font-semibold border border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800 transition"
+                >
+                  CSV İndir
+                </button>
+              </div>
+            </div>
+
+            <div className="overflow-x-auto max-h-[460px] overflow-y-auto">
+              <table className="w-full text-left border-collapse">
+                <thead className="sticky top-0 z-10 bg-slate-50 dark:bg-slate-900 border-b border-slate-100 dark:border-slate-800">
+                  <tr className="text-[11px] font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">
+                    <th className="py-3 px-5">Sıra</th>
+                    <th className="py-3 px-4">Uçak</th>
+                    <th className="py-3 px-4">TOPSIS Skoru</th>
+                    <th className="py-3 px-4">Karar</th>
+                    <th className="py-3 px-4">Tahmini Ömür</th>
+                    <th className="py-3 px-4">Sağlık</th>
+                    <th className="py-3 px-4">Yakıt</th>
+                    <th className="py-3 px-4">Termal</th>
+                    <th className="py-3 px-5 text-right">Uçuş</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 dark:divide-slate-800/70 text-sm">
+                  {filtrelenmis.map((u) => (
+                    <tr
+                      key={u.ucak_id}
+                      onClick={() => onUcakSec(u.ucak_id)}
+                      className="hover:bg-slate-50/90 dark:hover:bg-slate-800/40 cursor-pointer transition-colors"
+                    >
+                      <td className="py-3 px-5 font-mono text-xs text-slate-400">#{u.siralama}</td>
+                      <td className="py-3 px-4 font-mono font-bold text-slate-900 dark:text-white">Uçak #{u.ucak_id}</td>
+                      <td className="py-3 px-4 font-mono tabular font-bold text-blue-600 dark:text-sky-400">{u.topsis_skor.toFixed(4)}</td>
+                      <td className="py-3 px-4"><DurumRozeti metin={u.karar} /></td>
+                      <td className="py-3 px-4 font-mono tabular">{u.tahmini_kalan_omur.toFixed(1)} uçuş</td>
+                      <td className="py-3 px-4 font-mono tabular">%{u.saglik_skoru.toFixed(1)}</td>
+                      <td className="py-3 px-4 font-mono tabular text-slate-500 dark:text-slate-400">{u.yakit_verimlilik_skoru.toFixed(1)}</td>
+                      <td className="py-3 px-4 font-mono tabular text-slate-500 dark:text-slate-400">{u.termal_denge_skoru.toFixed(1)}</td>
+                      <td className="py-3 px-5 font-mono tabular text-right text-slate-500 dark:text-slate-400">{u.ucus_sayisi}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // =========================================================================
+    // 3. EKRAN: ROL 2 — BAKIM MÜHENDİSİ (KÖK NEDEN TEŞHİSİ & CANLI SÜRGÜLER)
+    // =========================================================================
+    const TEST_SENSORLERI = [
+      { key: 'ana_sikistirici_basinci', ad: 'Ana Sıkıştırıcı Basıncı (s11)' },
+      { key: 'egzoz_turbin_sicakligi', ad: 'Egzoz Türbin Sıcaklığı (s4)' },
+      { key: 'dis_ic_hava_orani', ad: 'Dış / İç Hava Oranı (s15)' },
+      { key: 'yakit_verim_orani', ad: 'Yakıt Akış / Basınç Oranı (s12)' },
+      { key: 'on_pervane_hizi_rpm', ad: 'Ön Pervane Hızı (s8)' },
+      { key: 'motor_basinc_orani', ad: 'Motor Basınç Oranı (s10)' },
+      { key: 'ana_sikistirici_toplam_basinci', ad: 'Sıkıştırıcı Toplam Basıncı (s7)' },
+    ];
+
+    function EkranBakimMuhendisi({ hamFilo, modelBilgi, seciliUcakId, onUcakDegistir, onSimuleEt }) {
+      const ucak = useMemo(
+        () => hamFilo.find((u) => u.ucak_id === seciliUcakId) || hamFilo[0],
+        [hamFilo, seciliUcakId]
+      );
+      const [sapmalar, setSapmalar] = useState({}); // { sensorKey: deltaSigma }
+      const [canliSonuc, setCanliSonuc] = useState(null);
+      const [gorunum, setGorunum] = useState('grafik'); // 'grafik' | 'tablo'
+      const debounceRef = useRef(null);
+      const abortRef = useRef(null);
+
+      useEffect(() => {
+        setSapmalar({});
+        setCanliSonuc(null);
+      }, [seciliUcakId]);
+
+      const degisiklikVar = Object.values(sapmalar).some((v) => Math.abs(v) > 0.01);
+
+      const guncelSensorler = useMemo(() => {
+        if (!ucak) return {};
+        const ist = modelBilgi.saglikli_istatistik;
+        const out = { ...ucak.sensorler };
+        Object.entries(sapmalar).forEach(([k, dSigma]) => {
+          if (ist[k] && out[k] !== undefined) out[k] = ucak.sensorler[k] + dSigma * ist[k].std;
+        });
+        return out;
+      }, [ucak, sapmalar, modelBilgi]);
+
+      // Anlık 60 FPS Z-skoru hesabı (sürgü kaydırılırken sıfır gecikme!)
+      const anlikZListesi = useMemo(() => {
+        const ist = modelBilgi.saglikli_istatistik;
+        const adlar = modelBilgi.gorunur_isimler;
+        return modelBilgi.sensorler.map((s) => {
+          const val = guncelSensorler[s];
+          const ort = ist[s].mean;
+          const std = ist[s].std || 1;
+          const z = (val - ort) / std;
+          const az = Math.abs(z);
+          return {
+            sensor: s,
+            gorunur_ad: adlar[s] || s,
+            deger: val,
+            normal_ortalama: ort,
+            z_skoru: Number(z.toFixed(2)),
+            durum: az >= 3.0 ? 'KRİTİK' : az >= 1.75 ? 'UYARI' : 'NORMAL',
+          };
+        }).sort((a, b) => Math.abs(b.z_skoru) - Math.abs(a.z_skoru));
+      }, [guncelSensorler, modelBilgi]);
+
+      // Debounced (80ms) gerçek Python ML + Kök Neden güncellemesi
+      useEffect(() => {
+        if (!ucak || !degisiklikVar) {
+          setCanliSonuc(null);
+          return;
+        }
+        clearTimeout(debounceRef.current);
+        debounceRef.current = setTimeout(async () => {
+          if (abortRef.current) abortRef.current.abort();
+          const ctrl = new AbortController();
+          abortRef.current = ctrl;
+          try {
+            const res = await fetch('/api/bakim/teshis', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ ucak_id: ucak.ucak_id, sensorler: guncelSensorler, ucus_sayisi: ucak.ucus_sayisi }),
+              signal: ctrl.signal,
+            });
+            if (res.ok) setCanliSonuc(await res.json());
+          } catch (_) {}
+        }, 80);
+        return () => clearTimeout(debounceRef.current);
+      }, [guncelSensorler, degisiklikVar, ucak]);
+
+      if (!ucak) return null;
+      const rapor = canliSonuc ? canliSonuc.teshis : ucak.teshis;
+      const saglik = canliSonuc ? canliSonuc.skor.saglik_skoru : ucak.saglik_skoru;
+      const tahminiOmur = canliSonuc ? canliSonuc.skor.tahmini_kalan_omur : ucak.tahmini_kalan_omur;
+      const kok = rapor.kok_nedenler[0];
+      const acilMi = rapor.bakim_aciliyeti.includes('ACİL');
+      const planliMi = rapor.bakim_aciliyeti.includes('PLANLI');
+
+      const maksZ = Math.max(4.2, ...anlikZListesi.slice(0, 10).map((x) => Math.abs(x.z_skoru))) * 1.1;
+
+      return (
+        <div className="space-y-6">
+          {/* Üst Sade Uçak Seçim Çubuğu */}
+          <div className="bg-white dark:bg-[#111827] border border-slate-200/80 dark:border-slate-800/90 rounded-2xl px-5 py-3.5 flex flex-wrap items-center justify-between gap-3 shadow-[0_1px_2px_rgba(15,23,42,0.03)]">
+            <div className="flex items-center gap-3">
+              <span className="text-xs font-semibold text-slate-500 dark:text-slate-400">İncelenen Uçak:</span>
+              <select
+                value={ucak.ucak_id}
+                onChange={(e) => onUcakDegistir(Number(e.target.value))}
+                className="px-3.5 py-2 rounded-xl text-sm font-semibold bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 focus:outline-none focus:border-blue-500 min-w-[230px]"
+              >
+                {hamFilo.map((u) => (
+                  <option key={u.ucak_id} value={u.ucak_id}>Uçak #{u.ucak_id} — Sağlık %{u.saglik_skoru.toFixed(0)} ({u.ariza_etiketi})</option>
+                ))}
+              </select>
+            </div>
+            <button
+              onClick={() => onSimuleEt(ucak.ucak_id)}
+              className="px-4 py-2 rounded-xl text-xs font-bold bg-slate-900 text-white dark:bg-sky-500 dark:text-slate-950 hover:opacity-90 transition"
+            >
+              Pilot Simülasyonunda Test Et →
+            </button>
+          </div>
+
+          {/* Tek Bakışta Kök Neden Hero Kartı */}
+          <div className={`rounded-2xl p-6 border ${
+            acilMi
+              ? 'bg-rose-50/70 border-rose-200 dark:bg-rose-950/25 dark:border-rose-900/60'
+              : planliMi
+                ? 'bg-amber-50/70 border-amber-200 dark:bg-amber-950/25 dark:border-amber-900/60'
+                : 'bg-emerald-50/70 border-emerald-200 dark:bg-emerald-950/25 dark:border-emerald-900/60'
+          }`}>
+            <div className="flex flex-wrap items-start justify-between gap-6">
+              <div className="space-y-2 max-w-2xl">
+                <div className="flex flex-wrap items-center gap-2.5">
+                  <DurumRozeti metin={rapor.bakim_aciliyeti} />
+                  <span className="text-xs font-mono font-semibold text-slate-500 dark:text-slate-400">
+                    Uçak #{ucak.ucak_id} · {ucak.ucus_sayisi} uçuş · Bakım Puanı: {rapor.bakim_oncelik_puani}/100
+                  </span>
+                </div>
+                <h2 className="text-2xl font-extrabold tracking-tight text-slate-900 dark:text-white">
+                  {kok.alt_sistem}
+                  <span className="ml-2.5 text-sm font-mono font-bold opacity-75">%{kok.guven_yuzdesi} Güven</span>
+                </h2>
+                <p className="text-sm text-slate-700 dark:text-slate-300 leading-relaxed">{kok.olasi_ariza}</p>
+                <div className="pt-1 text-xs font-semibold text-slate-800 dark:text-slate-200">
+                  Önerilen Aksiyon: <span className="font-normal text-slate-600 dark:text-slate-300">{rapor.onerilen_aksiyonlar[0]}</span>
+                </div>
+              </div>
+
+              <div className="flex gap-6 shrink-0">
+                <div className="text-right">
+                  <div className="text-xs text-slate-500 dark:text-slate-400">Tahmini Ömür</div>
+                  <div className="text-3xl font-extrabold font-mono tabular text-slate-900 dark:text-white">{tahminiOmur.toFixed(1)}</div>
+                  <div className="text-[11px] text-slate-500 dark:text-slate-400">Gerçek: {ucak.kalan_ucus_omru} uçuş</div>
+                </div>
+                <div className="w-px bg-slate-200/80 dark:bg-slate-700/60" />
+                <div className="text-right">
+                  <div className="text-xs text-slate-500 dark:text-slate-400">Motor Sağlığı</div>
+                  <div className="text-3xl font-extrabold font-mono tabular text-slate-900 dark:text-white">%{saglik.toFixed(1)}</div>
+                  <div className="text-[11px] text-slate-500 dark:text-slate-400">{degisiklikVar ? 'Canlı test aktif' : 'Orijinal sensör'}</div>
+                </div>
+              </div>
+            </div>
+
+            {rapor.yan_belirtiler && rapor.yan_belirtiler.length > 0 && (
+              <div className="mt-4 pt-3.5 border-t border-black/5 dark:border-white/10 text-xs text-slate-600 dark:text-slate-400 flex flex-wrap gap-x-6 gap-y-1">
+                <span className="font-semibold text-slate-700 dark:text-slate-300">İkincil Yan Belirtiler (Ayrı Arıza Değil):</span>
+                {rapor.yan_belirtiler.map((y) => (
+                  <span key={y.bolge}>• {y.bolge}</span>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* 2 Sütun: Sol Z-Skoru Görseli/Tablosu (62%) | Sağ Canlı 7 Sensör Sürgüleri (38%) */}
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+            <div className="lg:col-span-7 bg-white dark:bg-[#111827] border border-slate-200/80 dark:border-slate-800/90 rounded-2xl p-6 shadow-[0_1px_2px_rgba(15,23,42,0.03)] space-y-5">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <h3 className="text-[15px] font-bold text-slate-900 dark:text-white">Sensör Z-Skoru Sapmaları</h3>
+                  <p className="text-xs text-slate-500 dark:text-slate-400">Sağlıklı motor ortalamasına göre kaç standart sapma (σ) uzaklaştığı</p>
+                </div>
+                <div className="inline-flex rounded-xl p-1 bg-slate-100 dark:bg-slate-900 border border-slate-200/60 dark:border-slate-800">
+                  <button
+                    onClick={() => setGorunum('grafik')}
+                    className={`px-3 py-1 rounded-lg text-xs font-semibold transition ${gorunum === 'grafik' ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-white shadow-sm' : 'text-slate-500'}`}
+                  >
+                    Grafik
+                  </button>
+                  <button
+                    onClick={() => setGorunum('tablo')}
+                    className={`px-3 py-1 rounded-lg text-xs font-semibold transition ${gorunum === 'tablo' ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-white shadow-sm' : 'text-slate-500'}`}
+                  >
+                    16 Sensör Tablosu
+                  </button>
+                </div>
+              </div>
+
+              {gorunum === 'grafik' ? (
+                <div className="space-y-3 pt-1">
+                  {/* Eşik Açıklaması */}
+                  <div className="flex items-center justify-between text-[11px] text-slate-400 font-mono px-1">
+                    <span>-{maksZ.toFixed(1)}σ</span>
+                    <span className="text-amber-500">±1.75σ Uyarı · ±3.0σ Kritik</span>
+                    <span>+{maksZ.toFixed(1)}σ</span>
+                  </div>
+                  {anlikZListesi.slice(0, 10).map((s) => {
+                    const oran = Math.min(50, (Math.abs(s.z_skoru) / maksZ) * 50);
+                    const pozitif = s.z_skoru >= 0;
+                    const renk = s.durum === 'KRİTİK' ? 'bg-rose-500' : s.durum === 'UYARI' ? 'bg-amber-500' : 'bg-emerald-500';
+                    return (
+                      <div key={s.sensor} className="grid grid-cols-12 items-center gap-3">
+                        <div className="col-span-5 text-xs font-medium text-slate-700 dark:text-slate-300 truncate" title={s.gorunur_ad}>
+                          {s.gorunur_ad}
+                        </div>
+                        <div className="col-span-5 relative h-5 flex items-center">
+                          <div className="w-full h-2 rounded-full bg-slate-100 dark:bg-slate-800/80 relative overflow-hidden">
+                            {/* Merkez çizgisi */}
+                            <div className="absolute left-1/2 top-0 bottom-0 w-px bg-slate-300 dark:bg-slate-600 z-10" />
+                            {/* Bar */}
+                            <div
+                              className={`absolute top-0 bottom-0 rounded-full ${renk} transition-all duration-150`}
+                              style={{
+                                left: pozitif ? '50%' : `${50 - oran}%`,
+                                width: `${Math.max(1.5, oran)}%`,
+                              }}
+                            />
+                          </div>
+                        </div>
+                        <div className={`col-span-2 text-right font-mono tabular text-xs font-bold ${
+                          s.durum === 'KRİTİK' ? 'text-rose-600 dark:text-rose-400' : s.durum === 'UYARI' ? 'text-amber-600 dark:text-amber-400' : 'text-slate-500 dark:text-slate-400'
+                        }`}>
+                          {s.z_skoru >= 0 ? '+' : ''}{s.z_skoru.toFixed(2)}σ
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : (
+                <div className="overflow-y-auto max-h-[380px]">
+                  <table className="w-full text-left border-collapse text-xs">
+                    <thead className="sticky top-0 bg-slate-50 dark:bg-slate-900 text-slate-500 border-b border-slate-100 dark:border-slate-800">
+                      <tr>
+                        <th className="py-2.5 px-3">Sensör</th>
+                        <th className="py-2.5 px-3 text-right">Güncel</th>
+                        <th className="py-2.5 px-3 text-right">Sağlıklı Ort.</th>
+                        <th className="py-2.5 px-3 text-right">Z-Skoru</th>
+                        <th className="py-2.5 px-3 text-right">Durum</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100 dark:divide-slate-800/60">
+                      {anlikZListesi.map((s) => (
+                        <tr key={s.sensor}>
+                          <td className="py-2.5 px-3 font-medium text-slate-700 dark:text-slate-200">{s.gorunur_ad}</td>
+                          <td className="py-2.5 px-3 text-right font-mono tabular">{s.deger.toFixed(2)}</td>
+                          <td className="py-2.5 px-3 text-right font-mono tabular text-slate-400">{s.normal_ortalama.toFixed(2)}</td>
+                          <td className="py-2.5 px-3 text-right font-mono tabular font-bold">{s.z_skoru >= 0 ? '+' : ''}{s.z_skoru.toFixed(2)}σ</td>
+                          <td className="py-2.5 px-3 text-right"><DurumRozeti metin={s.durum} /></td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+
+            {/* Sağ: 7 Sensörlü Pürüzsüz Canlı Test */}
+            <div className="lg:col-span-5 bg-white dark:bg-[#111827] border border-slate-200/80 dark:border-slate-800/90 rounded-2xl p-6 shadow-[0_1px_2px_rgba(15,23,42,0.03)] flex flex-col justify-between space-y-5">
+              <div className="space-y-4">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <h3 className="text-[15px] font-bold text-slate-900 dark:text-white">Canlı Sensör Testi</h3>
+                    <p className="text-xs text-slate-500 dark:text-slate-400">Sürgüleri kaydırarak yapay zekanın arıza tepkisini anlık görün</p>
+                  </div>
+                  {degisiklikVar && (
+                    <button
+                      onClick={() => setSapmalar({})}
+                      className="px-2.5 py-1 rounded-lg text-xs font-semibold text-blue-600 dark:text-sky-400 hover:bg-blue-50 dark:hover:bg-sky-500/10"
+                    >
+                      Sıfırla
+                    </button>
+                  )}
+                </div>
+
+                <div className="space-y-3.5">
+                  {TEST_SENSORLERI.map((ts) => {
+                    const delta = sapmalar[ts.key] || 0;
+                    const gVal = guncelSensorler[ts.key];
+                    const normalOrt = modelBilgi.saglikli_istatistik[ts.key]?.mean;
+                    return (
+                      <div key={ts.key} className="space-y-1">
+                        <div className="flex items-baseline justify-between gap-2 text-xs">
+                          <span className="font-medium text-slate-700 dark:text-slate-300 truncate">{ts.ad}</span>
+                          <div className="flex items-baseline gap-2 shrink-0 font-mono tabular">
+                            {normalOrt !== undefined && (
+                              <span className="text-[10.5px] text-slate-400 dark:text-slate-500">
+                                Sağlıklı Ort: {normalOrt.toFixed(2)}
+                              </span>
+                            )}
+                            <span className="font-semibold text-slate-900 dark:text-white">
+                              {gVal?.toFixed(2)}
+                              {Math.abs(delta) > 0.05 && (
+                                <span className="ml-1 text-blue-600 dark:text-sky-400">({delta > 0 ? '+' : ''}{delta.toFixed(1)}σ)</span>
+                              )}
+                            </span>
+                          </div>
+                        </div>
+                        <input
+                          type="range"
+                          min="-5"
+                          max="5"
+                          step="0.2"
+                          value={delta}
+                          onChange={(e) => setSapmalar((prev) => ({ ...prev, [ts.key]: Number(e.target.value) }))}
+                          className="w-full"
+                        />
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div className="p-3.5 rounded-xl bg-slate-50 dark:bg-slate-900/70 border border-slate-100 dark:border-slate-800 text-[11.5px] text-slate-600 dark:text-slate-400 leading-relaxed">
+                <span className="font-bold text-slate-800 dark:text-slate-200">HPC vs. Ön Pervane Ayırımı:</span> HPC arızasında <b>s11</b> ve <b>s15</b> yükselirken <b>s12</b> düşer; Ön Pervane arızasında <b>s15</b> düşerken <b>s8, s10</b> ve <b>s12</b> yükselir.
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // =========================================================================
+    // 4. EKRAN: ROL 3 — PİLOT SİMÜLASYONU ("YA ŞÖYLE OLURSA?" WHAT-IF)
+    // =========================================================================
+    const PILOT_SENARYOLARI = [
+      { id: 'normal', ad: 'Normal Uçuş' },
+      { id: 'sikistirici_asinmasi', ad: 'Ana Sıkıştırıcı (HPC)' },
+      { id: 'on_pervane_fan_arizasi', ad: 'Ön Pervane (Fan)' },
+    ];
+
+    function EkranPilotSimulasyon({ hamFilo, seciliUcakId, onUcakDegistir }) {
+      const [yakit, setYakit] = useState(3000);
+      const [hedef, setHedef] = useState(800);
+      const [yedekUs, setYedekUs] = useState(220);
+      const [mod, setMod] = useState('standart');
+      const [senaryo, setSenaryo] = useState('sikistirici_asinmasi');
+      const [manuelAcik, setManuelAcik] = useState(false);
+      const [ekSic, setEkSic] = useState(0);
+      const [ekBas, setEkBas] = useState(0);
+      const [ekYak, setEkYak] = useState(0);
+      const [sonuc, setSonuc] = useState(null);
+
+      const ucak = useMemo(() => hamFilo.find((u) => u.ucak_id === seciliUcakId) || hamFilo[0], [hamFilo, seciliUcakId]);
+      const timerRef = useRef(null);
+      const abortRef = useRef(null);
+
+      useEffect(() => {
+        if (!ucak) return;
+        clearTimeout(timerRef.current);
+        timerRef.current = setTimeout(async () => {
+          if (abortRef.current) abortRef.current.abort();
+          const ctrl = new AbortController();
+          abortRef.current = ctrl;
+          const ozel = {};
+          if (ekSic > 0) ozel.egzoz_turbin_sicakligi = ucak.sensorler.egzoz_turbin_sicakligi + ekSic;
+          if (ekBas > 0) ozel.ana_sikistirici_basinci = ucak.sensorler.ana_sikistirici_basinci + ekBas;
+          if (ekYak > 0) ozel.yakit_verim_orani = ucak.sensorler.yakit_verim_orani - ekYak;
+          try {
+            const res = await fetch('/api/pilot/simulasyon', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                ucak_id: ucak.ucak_id,
+                mevcut_yakit_kg: yakit,
+                hedef_menzil_km: hedef,
+                en_yakin_us_km: yedekUs,
+                ucus_modu: mod,
+                senaryo_adi: senaryo,
+                ozel_sensor_degisimleri: Object.keys(ozel).length ? ozel : null,
+              }),
+              signal: ctrl.signal,
+            });
+            if (res.ok) setSonuc(await res.json());
+          } catch (_) {}
+        }, 70);
+        return () => clearTimeout(timerRef.current);
+      }, [ucak, yakit, hedef, yedekUs, mod, senaryo, ekSic, ekBas, ekYak]);
+
+      const maxKm = sonuc ? Math.max(sonuc.maksimum_menzil_km, hedef, yedekUs, 100) : 1000;
+      const maxKg = sonuc ? Math.max(sonuc.mevcut_yakit_kg, sonuc.gerekli_yakit_hedef_kg, sonuc.gerekli_yakit_us_kg, 500) : 3500;
+
+      return (
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+          {/* Sol: Minimalist Kontrol Paneli */}
+          <div className="lg:col-span-4 bg-white dark:bg-[#111827] border border-slate-200/80 dark:border-slate-800/90 rounded-2xl p-6 shadow-[0_1px_2px_rgba(15,23,42,0.03)] space-y-5 h-fit">
+            <div>
+              <h2 className="text-[15px] font-bold text-slate-900 dark:text-white">Uçuş & Arıza Senaryosu</h2>
+              <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">Değerleri değiştirdiğinizde karar anında güncellenir</p>
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="text-xs font-semibold text-slate-600 dark:text-slate-300">Uçak</label>
+              <select
+                value={seciliUcakId}
+                onChange={(e) => onUcakDegistir(Number(e.target.value))}
+                className="w-full px-3.5 py-2 rounded-xl text-sm font-semibold bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700"
+              >
+                {hamFilo.map((u) => (
+                  <option key={u.ucak_id} value={u.ucak_id}>Uçak #{u.ucak_id} — Sağlık %{u.saglik_skoru.toFixed(0)}</option>
+                ))}
+              </select>
+            </div>
+
+            {/* 3 Sayısal Parametre */}
+            <div className="grid grid-cols-3 gap-2.5">
+              {[
+                { ad: 'Yakıt (kg)', v: yakit, set: setYakit, step: 100 },
+                { ad: 'Hedef (km)', v: hedef, set: setHedef, step: 50 },
+                { ad: 'Üs (km)', v: yedekUs, set: setYedekUs, step: 20 },
+              ].map((inp) => (
+                <div key={inp.ad} className="space-y-1">
+                  <label className="text-[11px] font-medium text-slate-500 dark:text-slate-400">{inp.ad}</label>
+                  <input
+                    type="number"
+                    step={inp.step}
+                    value={inp.v}
+                    onChange={(e) => inp.set(Math.max(50, Number(e.target.value) || 0))}
+                    className="w-full px-2.5 py-2 rounded-xl text-sm font-mono font-bold bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 focus:outline-none focus:border-blue-500"
+                  />
+                </div>
+              ))}
+            </div>
+
+            {/* Uçuş Modu */}
+            <div className="space-y-1.5">
+              <label className="text-xs font-semibold text-slate-600 dark:text-slate-300">Uçuş Modu</label>
+              <div className="grid grid-cols-3 gap-1.5 p-1 rounded-xl bg-slate-100 dark:bg-slate-900">
+                {[
+                  { id: 'ekonomi', ad: 'Ekonomi' },
+                  { id: 'standart', ad: 'Standart' },
+                  { id: 'muharebe', ad: 'Muharebe' },
+                ].map((m) => (
+                  <button
+                    key={m.id}
+                    onClick={() => setMod(m.id)}
+                    className={`py-1.5 rounded-lg text-xs font-semibold transition ${
+                      mod === m.id ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-white shadow-sm' : 'text-slate-500'
+                    }`}
+                  >
+                    {m.ad}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Hazır Arıza Senaryoları (Sadece FD003 Gerçek Modları: Normal, HPC, Ön Pervane) */}
+            <div className="space-y-2">
+              <label className="text-xs font-semibold text-slate-600 dark:text-slate-300">Havada Arıza Senaryosu (FD003)</label>
+              <div className="space-y-2">
+                {PILOT_SENARYOLARI.map((s) => (
+                  <button
+                    key={s.id}
+                    onClick={() => setSenaryo(s.id)}
+                    className={`w-full px-3.5 py-2.5 rounded-xl text-xs font-semibold text-left border transition ${
+                      senaryo === s.id
+                        ? 'bg-slate-900 text-white border-slate-900 dark:bg-sky-500/15 dark:border-sky-400 dark:text-sky-200'
+                        : 'bg-slate-50/70 dark:bg-slate-900/50 border-slate-200/80 dark:border-slate-800 text-slate-700 dark:text-slate-300 hover:border-slate-300'
+                    }`}
+                  >
+                    {s.ad}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Açılır Manuel Sapmalar */}
+            <div className="pt-2 border-t border-slate-100 dark:border-slate-800">
+              <button
+                onClick={() => setManuelAcik((v) => !v)}
+                className="text-xs font-semibold text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white"
+              >
+                {manuelAcik ? '− Ek Manuel Sensör Sapmalarını Gizle' : '+ Ek Manuel Sensör Sapması Ekle'}
+              </button>
+              {manuelAcik && (
+                <div className="mt-3 space-y-3">
+                  <div>
+                    <div className="flex justify-between text-xs"><span>Ek Egzoz Sıcaklığı</span><span className="font-mono font-bold">+{ekSic}</span></div>
+                    <input type="range" min="0" max="40" value={ekSic} onChange={(e) => setEkSic(Number(e.target.value))} className="w-full" />
+                  </div>
+                  <div>
+                    <div className="flex justify-between text-xs"><span>Ek Sıkıştırıcı Basıncı</span><span className="font-mono font-bold">+{ekBas.toFixed(2)}</span></div>
+                    <input type="range" min="0" max="1.5" step="0.05" value={ekBas} onChange={(e) => setEkBas(Number(e.target.value))} className="w-full" />
+                  </div>
+                  <div>
+                    <div className="flex justify-between text-xs"><span>Ek Yakıt Akış / Basınç Sapması (s12)</span><span className="font-mono font-bold">-{ekYak.toFixed(1)}</span></div>
+                    <input type="range" min="0" max="3.0" step="0.1" value={ekYak} onChange={(e) => setEkYak(Number(e.target.value))} className="w-full" />
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Sağ: Pilot Kararı ve Menzil/Yakıt Görselleri */}
+          <div className="lg:col-span-8 space-y-6">
+            {sonuc && (
+              <>
+                {/* Karar Bannerı */}
+                <div className={`rounded-2xl p-6 border ${
+                  sonuc.risk_seviyesi === 'KRİTİK'
+                    ? 'bg-rose-50/80 border-rose-200 dark:bg-rose-950/30 dark:border-rose-900/60'
+                    : sonuc.risk_seviyesi === 'ORTA'
+                      ? 'bg-amber-50/80 border-amber-200 dark:bg-amber-950/30 dark:border-amber-900/60'
+                      : 'bg-emerald-50/80 border-emerald-200 dark:bg-emerald-950/30 dark:border-emerald-900/60'
+                }`}>
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-[11px] font-bold uppercase tracking-widest text-slate-500 dark:text-slate-400">
+                      Pilot Karar Önerisi · Uçak #{sonuc.ucak_id}
+                    </span>
+                    <DurumRozeti metin={`RİSK: ${sonuc.risk_seviyesi}`} />
+                  </div>
+                  <div className="mt-2 text-2xl sm:text-[26px] font-extrabold tracking-tight text-slate-900 dark:text-white">
+                    {sonuc.pilot_karari}
+                  </div>
+                  <p className="mt-1.5 text-sm text-slate-700 dark:text-slate-300 leading-relaxed">{sonuc.karar_gerekcesi}</p>
+                </div>
+
+                {/* 4 Önce → Sonra Metriği */}
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+                  <MetrikKarti
+                    etiket="Motor Sağlığı"
+                    deger={`%${sonuc.yeni_saglik}`}
+                    alt={`Önceki: %${sonuc.onceki_saglik}`}
+                    vurgu={sonuc.yeni_saglik < 40 ? 'rose' : sonuc.yeni_saglik < 75 ? 'amber' : 'emerald'}
+                  />
+                  <MetrikKarti
+                    etiket="Kalan Ömür"
+                    deger={`${sonuc.yeni_omur}`}
+                    alt={`Önceki: ${sonuc.onceki_omur} uçuş`}
+                    vurgu="blue"
+                  />
+                  <MetrikKarti
+                    etiket="Yakıt Tüketimi"
+                    deger={`${sonuc.yeni_tuketim_kg_km}`}
+                    alt={`kg/km (+%${sonuc.yakit_artisi_yuzde} artış)`}
+                    vurgu={sonuc.yakit_artisi_yuzde >= 4 ? 'amber' : 'emerald'}
+                  />
+                  <MetrikKarti
+                    etiket="Maksimum Menzil"
+                    deger={`${Math.round(sonuc.maksimum_menzil_km)} km`}
+                    alt={sonuc.hedefe_yakit_yeterli_mi ? `Hedef (${hedef} km) karşılanır` : `Hedefe (${hedef} km) yetmez`}
+                    vurgu={sonuc.hedefe_yakit_yeterli_mi ? 'emerald' : 'rose'}
+                  />
+                </div>
+
+                {/* 2 Temiz Yatay Kıyaslama Kartı (Menzil + Yakıt Bütçesi) */}
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                  <div className="bg-white dark:bg-[#111827] border border-slate-200/80 dark:border-slate-800/90 rounded-2xl p-6 space-y-4">
+                    <h3 className="text-[15px] font-bold text-slate-900 dark:text-white">Menzil Karşılaştırması (km)</h3>
+                    {[
+                      { ad: 'Maksimum Uçulabilecek Menzil', v: sonuc.maksimum_menzil_km, renk: sonuc.hedefe_yakit_yeterli_mi ? 'bg-emerald-500' : 'bg-rose-500' },
+                      { ad: 'Görev Hedef Mesafesi', v: hedef, renk: 'bg-amber-500' },
+                      { ad: 'En Yakın Yedek Üs', v: yedekUs, renk: 'bg-sky-500' },
+                    ].map((b) => (
+                      <div key={b.ad} className="space-y-1.5">
+                        <div className="flex justify-between text-xs">
+                          <span className="font-medium text-slate-600 dark:text-slate-300">{b.ad}</span>
+                          <span className="font-mono tabular font-bold text-slate-900 dark:text-white">{Math.round(b.v)} km</span>
+                        </div>
+                        <div className="h-2.5 rounded-full bg-slate-100 dark:bg-slate-800 overflow-hidden">
+                          <div className={`h-full rounded-full ${b.renk} transition-all duration-300`} style={{ width: `${Math.min(100, (b.v / maxKm) * 100)}%` }} />
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+
+                  <div className="bg-white dark:bg-[#111827] border border-slate-200/80 dark:border-slate-800/90 rounded-2xl p-6 space-y-4">
+                    <h3 className="text-[15px] font-bold text-slate-900 dark:text-white">Yakıt Bütçesi (%10 Güvenlik Rezervli)</h3>
+                    {[
+                      { ad: 'Depodaki Mevcut Yakıt', v: sonuc.mevcut_yakit_kg, renk: 'bg-blue-600 dark:bg-sky-400' },
+                      { ad: 'Hedef İçin Gerekli Yakıt', v: sonuc.gerekli_yakit_hedef_kg, renk: sonuc.hedefe_yakit_yeterli_mi ? 'bg-emerald-500' : 'bg-rose-500' },
+                      { ad: 'Yedek Üs İçin Gerekli Yakıt', v: sonuc.gerekli_yakit_us_kg, renk: 'bg-slate-400 dark:bg-slate-500' },
+                    ].map((b) => (
+                      <div key={b.ad} className="space-y-1.5">
+                        <div className="flex justify-between text-xs">
+                          <span className="font-medium text-slate-600 dark:text-slate-300">{b.ad}</span>
+                          <span className="font-mono tabular font-bold text-slate-900 dark:text-white">{Math.round(b.v)} kg</span>
+                        </div>
+                        <div className="h-2.5 rounded-full bg-slate-100 dark:bg-slate-800 overflow-hidden">
+                          <div className={`h-full rounded-full ${b.renk} transition-all duration-300`} style={{ width: `${Math.min(100, (b.v / maxKg) * 100)}%` }} />
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    // =========================================================================
+    // 5. EKRAN: ML MODELLERİ & EN ETKİLİ SENSÖRLER
+    // =========================================================================
+    function EkranMLModelleri({ modelBilgi, onModelDegisti }) {
+      const [egitiliyor, setEgitiliyor] = useState(false);
+      const [hoverNokta, setHoverNokta] = useState(null);
+
+      const tablo = useMemo(
+        () => [...(modelBilgi.karsilastirma_tablosu || [])].sort((a, b) => a.mae - b.mae),
+        [modelBilgi]
+      );
+      const aktifKod = modelBilgi.algoritma_kodu;
+      const noktalar = modelBilgi.karsilastirma_noktalari || [];
+      const sensorler = (modelBilgi.sensor_onemleri || []).slice(0, 8);
+      const maxSensor = Math.max(1, ...sensorler.map((s) => s.onem_yuzdesi));
+
+      const modelCalistir = async (mod, kod) => {
+        setEgitiliyor(true);
+        try {
+          const res = await fetch('/api/model/egit', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ mod, algoritma_kodu: kod }),
+          });
+          if (res.ok) onModelDegisti(await res.json());
+        } finally {
+          setEgitiliyor(false);
+        }
+      };
+
+      const lim = 150;
+      const W = 440, H = 270, PAD = 34;
+      const px = (v) => PAD + (Math.min(lim, Math.max(0, v)) / lim) * (W - PAD * 1.5);
+      const py = (v) => H - PAD - (Math.min(lim, Math.max(0, v)) / lim) * (H - PAD * 1.5);
+
+      return (
+        <div className="space-y-6">
+          {/* 4 Model Seçilebilir Karşılaştırma Kartları */}
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h2 className="text-[15px] font-bold text-slate-900 dark:text-white">4 Makine Öğrenmesi Modeli Kıyaslaması</h2>
+              <p className="text-xs text-slate-500 dark:text-slate-400">Herhangi bir modele tıklayarak tüm KDS ekranlarını o modelle anında besleyebilirsiniz</p>
+            </div>
+            <button
+              disabled={egitiliyor}
+              onClick={() => modelCalistir('dortlu', aktifKod)}
+              className="px-4 py-2 rounded-xl text-xs font-bold bg-slate-900 text-white dark:bg-sky-500 dark:text-slate-950 hover:opacity-90 disabled:opacity-50 transition"
+            >
+              {egitiliyor ? 'Modeller Eğitiliyor...' : '4 Modeli Yeniden Eğit & Kıyasla'}
+            </button>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+            {tablo.map((m, idx) => {
+              const aktif = m.algoritma_kodu === aktifKod;
+              return (
+                <button
+                  key={m.algoritma_kodu}
+                  disabled={egitiliyor}
+                  onClick={() => !aktif && modelCalistir('tekli', m.algoritma_kodu)}
+                  className={`text-left p-5 rounded-2xl border transition-all ${
+                    aktif
+                      ? 'bg-slate-900 text-white border-slate-900 dark:bg-sky-500/15 dark:border-sky-400 shadow-sm'
+                      : 'bg-white dark:bg-[#111827] border-slate-200/80 dark:border-slate-800 hover:border-blue-400 dark:hover:border-sky-500/60'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className={`text-xs font-bold ${aktif ? 'text-emerald-400' : 'text-slate-400'}`}>
+                      {aktif ? '● AKTİF MODEL' : idx === 0 ? 'EN DÜŞÜK HATA' : `${idx + 1}. SIRA`}
+                    </span>
+                    <span className={`text-[11px] font-mono ${aktif ? 'text-slate-400' : 'text-slate-400'}`}>{m.egitim_suresi_sn} sn</span>
+                  </div>
+                  <div className="mt-2 text-base font-extrabold">{m.kisa_ad || m.algoritma}</div>
+                  <div className="mt-4 grid grid-cols-3 gap-2 pt-3 border-t border-white/10 dark:border-slate-800 font-mono tabular">
+                    <div>
+                      <div className="text-[10px] opacity-60">MAE</div>
+                      <div className="text-sm font-bold">{m.mae}</div>
+                    </div>
+                    <div>
+                      <div className="text-[10px] opacity-60">RMSE</div>
+                      <div className="text-sm font-bold">{m.rmse}</div>
+                    </div>
+                    <div>
+                      <div className="text-[10px] opacity-60">R²</div>
+                      <div className="text-sm font-bold">{m.r2}</div>
+                    </div>
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+
+          {/* 2 Etkileşimli SVG Grafik Kartı */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            {/* Gerçek vs Tahmin Saçılım Grafiği */}
+            <div className="bg-white dark:bg-[#111827] border border-slate-200/80 dark:border-slate-800/90 rounded-2xl p-6 shadow-[0_1px_2px_rgba(15,23,42,0.03)] space-y-3">
+              <div className="flex items-center justify-between gap-2">
+                <div>
+                  <h3 className="text-[15px] font-bold text-slate-900 dark:text-white">Gerçek vs. Tahmini Ömür (100 Test Uçağı)</h3>
+                  <p className="text-xs text-slate-500 dark:text-slate-400">Noktaların üzerine gelerek uçak bazlı tahmin hatasını görebilirsiniz</p>
+                </div>
+                {hoverNokta && (
+                  <span className="px-2.5 py-1 rounded-lg bg-slate-100 dark:bg-slate-800 text-[11px] font-mono font-semibold text-slate-700 dark:text-slate-200">
+                    #{hoverNokta.ucak_id}: Gerçek {hoverNokta.gercek_omur} → Tahmin {hoverNokta.tahmini_omur}
+                  </span>
+                )}
+              </div>
+              <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-auto select-none">
+                {[0, 30, 60, 90, 120, 150].map((v) => (
+                  <g key={v}>
+                    <line x1={PAD} y1={py(v)} x2={W - 16} y2={py(v)} stroke="currentColor" strokeDasharray="3 3" className="text-slate-200 dark:text-slate-800" />
+                    <text x={PAD - 6} y={py(v) + 3} textAnchor="end" fontSize="9" className="fill-slate-400 font-mono">{v}</text>
+                    <text x={px(v)} y={H - 12} textAnchor="middle" fontSize="9" className="fill-slate-400 font-mono">{v}</text>
+                  </g>
+                ))}
+                {/* İdeal y = x çizgisi */}
+                <line x1={px(0)} y1={py(0)} x2={px(lim)} y2={py(lim)} stroke="#3B82F6" strokeWidth="1.5" strokeDasharray="5 4" opacity="0.7" />
+                {noktalar.map((n) => {
+                  const fill = n.hata <= 15 ? '#10B981' : n.hata <= 30 ? '#F59E0B' : '#F43F5E';
+                  const isHov = hoverNokta && hoverNokta.ucak_id === n.ucak_id;
+                  return (
+                    <circle
+                      key={n.ucak_id}
+                      cx={px(n.gercek_omur)}
+                      cy={py(n.tahmini_omur)}
+                      r={isHov ? 6 : 3.7}
+                      fill={fill}
+                      opacity={isHov ? 1 : 0.85}
+                      className="cursor-pointer transition-all"
+                      onMouseEnter={() => setHoverNokta(n)}
+                      onMouseLeave={() => setHoverNokta(null)}
+                    />
+                  );
+                })}
+              </svg>
+            </div>
+
+            {/* En Etkili 8 Sensör */}
+            <div className="bg-white dark:bg-[#111827] border border-slate-200/80 dark:border-slate-800/90 rounded-2xl p-6 shadow-[0_1px_2px_rgba(15,23,42,0.03)] space-y-4">
+              <div>
+                <h3 className="text-[15px] font-bold text-slate-900 dark:text-white">En Etkili Sensörler (Etki Payı %)</h3>
+                <p className="text-xs text-slate-500 dark:text-slate-400">16 aktif sensör arasında kalan ömürle en güçlü ilişkiye sahip ilk 8 sensör</p>
+              </div>
+              <div className="space-y-3 pt-1">
+                {sensorler.map((s, idx) => (
+                  <div key={s.sensor_kodu} className="space-y-1">
+                    <div className="flex justify-between text-xs">
+                      <span className="font-medium text-slate-700 dark:text-slate-200">
+                        <span className="font-mono text-slate-400 mr-2">{idx + 1}.</span>
+                        {s.sensor_adi}
+                      </span>
+                      <span className="font-mono tabular font-bold text-slate-900 dark:text-white">%{s.onem_yuzdesi.toFixed(2)}</span>
+                    </div>
+                    <div className="h-2 rounded-full bg-slate-100 dark:bg-slate-800 overflow-hidden">
+                      <div
+                        className={`h-full rounded-full transition-all duration-500 ${idx < 3 ? 'bg-blue-600 dark:bg-sky-400' : 'bg-slate-400 dark:bg-slate-600'}`}
+                        style={{ width: `${(s.onem_yuzdesi / maxSensor) * 100}%` }}
+                      />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // =========================================================================
+    // ANA UYGULAMA KAPSAYICISI (TEMİZ ÜST MENÜ + AÇIK/KOYU TEMA)
+    // =========================================================================
+    const SEKMELER = [
+      { id: 'ozet', ad: 'Genel Bakış' },
+      { id: 'filo', ad: 'Filo Komutanı' },
+      { id: 'bakim', ad: 'Bakım Mühendisi' },
+      { id: 'pilot', ad: 'Pilot Simülasyonu' },
+      { id: 'model', ad: 'ML Modelleri' },
+    ];
+
+    function App() {
+      const [veri, setVeri] = useState(null);
+      const [hata, setHata] = useState('');
+      const [sekme, setSekme] = useState('ozet');
+      const [seciliUcak, setSeciliUcak] = useState(50);
+      const [pilotUcak, setPilotUcak] = useState(37);
+      const [koyuTema, setKoyuTema] = useState(false);
+
+      useEffect(() => {
+        document.documentElement.classList.toggle('dark', koyuTema);
+      }, [koyuTema]);
+
+      useEffect(() => {
+        fetch('/api/bootstrap')
+          .then((r) => r.json())
+          .then((d) => setVeri(d))
+          .catch((e) => setHata(String(e)));
+      }, []);
+
+      const varsayilanSiraliFilo = useMemo(() => {
+        if (!veri) return [];
+        const ahp = ahpHesapla(GOREV_PROFILLERI.dengeli.matris);
+        return topsisSirala(veri.filo, ahp.agirliklar);
+      }, [veri]);
+
+      const bakimaGit = useCallback((uid) => {
+        setSeciliUcak(uid);
+        setSekme('bakim');
+      }, []);
+
+      const pilotaGit = useCallback((uid) => {
+        setPilotUcak(uid);
+        setSekme('pilot');
+      }, []);
+
+      if (hata) {
+        return <div className="min-h-screen flex items-center justify-center text-rose-600 font-semibold">Bağlantı hatası: {hata}</div>;
+      }
+      if (!veri) {
+        return (
+          <div className="min-h-screen flex items-center justify-center gap-3 text-slate-500">
+            <div className="w-5 h-5 border-2 border-slate-900 dark:border-sky-400 border-t-transparent rounded-full animate-spin" />
+            <span className="text-sm font-medium">TurbofanDSS verileri yükleniyor...</span>
+          </div>
+        );
+      }
+
+      const m = veri.model.metrikler || {};
+
+      return (
+        <div className="min-h-screen flex flex-col">
+          {/* Üst Sade Sabit Navigasyon Çubuğu */}
+          <header className="sticky top-0 z-30 bg-white/85 dark:bg-[#090D16]/85 backdrop-blur-xl border-b border-slate-200/80 dark:border-slate-800/80">
+            <div className="max-w-[1320px] mx-auto px-5 sm:px-8 h-16 flex items-center justify-between gap-4">
+              {/* Sol Marka */}
+              <div className="flex items-center gap-3 shrink-0">
+                <div className="w-8 h-8 rounded-xl bg-slate-900 dark:bg-sky-500 flex items-center justify-center text-white dark:text-slate-950 font-extrabold text-sm">
+                  T
+                </div>
+                <div className="leading-tight">
+                  <div className="text-sm font-extrabold tracking-tight text-slate-900 dark:text-white">TurbofanDSS</div>
+                  <div className="text-[10.5px] font-medium text-slate-400">NASA FD003 · KDS</div>
+                </div>
+              </div>
+
+              {/* Orta Temiz Sekmeli Navigasyon */}
+              <nav className="flex items-center gap-1 p-1 rounded-xl bg-slate-100/90 dark:bg-slate-900 border border-slate-200/60 dark:border-slate-800 overflow-x-auto">
+                {SEKMELER.map((s) => (
+                  <button
+                    key={s.id}
+                    onClick={() => setSekme(s.id)}
+                    className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold whitespace-nowrap transition-all ${
+                      sekme === s.id
+                        ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-white shadow-sm'
+                        : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+                    }`}
+                  >
+                    {s.ad}
+                  </button>
+                ))}
+              </nav>
+
+              {/* Sağ Aktif Model Rozeti + Tema Butonu */}
+              <div className="flex items-center gap-2.5 shrink-0">
+                <span className="hidden xl:inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[11px] font-mono font-semibold bg-slate-100 dark:bg-slate-900 text-slate-600 dark:text-slate-300 border border-slate-200/70 dark:border-slate-800">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                  {m.kisa_ad || 'Gradient Boosting'} · MAE {m.mae}
+                </span>
+                <button
+                  onClick={() => setKoyuTema((v) => !v)}
+                  className="px-3 py-1.5 rounded-xl text-xs font-semibold border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 transition"
+                >
+                  {koyuTema ? '☀ Açık' : '☾ Koyu'}
+                </button>
+              </div>
+            </div>
+          </header>
+
+          {/* Ana İçerik Alanı */}
+          <main className="flex-1 max-w-[1320px] w-full mx-auto px-5 sm:px-8 py-7">
+            {sekme === 'ozet' && (
+              <EkranGenelBakis siraliFilo={varsayilanSiraliFilo} onBakimaGit={bakimaGit} onSimuleEt={pilotaGit} />
+            )}
+            {sekme === 'filo' && (
+              <EkranFiloKomutani hamFilo={veri.filo} onUcakSec={bakimaGit} />
+            )}
+            {sekme === 'bakim' && (
+              <EkranBakimMuhendisi
+                hamFilo={veri.filo}
+                modelBilgi={veri.model}
+                seciliUcakId={seciliUcak}
+                onUcakDegistir={setSeciliUcak}
+                onSimuleEt={pilotaGit}
+              />
+            )}
+            {sekme === 'pilot' && (
+              <EkranPilotSimulasyon
+                hamFilo={veri.filo}
+                seciliUcakId={pilotUcak}
+                onUcakDegistir={setPilotUcak}
+              />
+            )}
+            {sekme === 'model' && (
+              <EkranMLModelleri modelBilgi={veri.model} onModelDegisti={setVeri} />
+            )}
+          </main>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
